@@ -1,0 +1,2 @@
+use Dist::Template::Tasks module => 'Remote::Command', readme => 'bin/remote-command';
+

@@ -1,0 +1,261 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use utf8;
+use Getopt::Long qw(:config no_auto_abbrev no_ignore_case bundling);
+use IO::Handle;
+use IO::Poll qw(POLLIN POLLOUT);
+use IO::Pty;
+use Net::OpenSSH;
+use Parallel::ForkManager;
+use File::Basename 'basename';
+use POSIX qw(setsid);
+use Pod::Usage 'pod2usage';
+use constant CHUNK_SIZE => 64 * 1024;
+my $SUDO_PROMPT = sprintf "sudo password (asking by %s): ", basename($0);
+STDOUT->autoflush(1);
+
+=head1 NAME
+
+remote-command - simple launcher of remote command
+
+=head1 SYNOPSIS
+
+    > remote-command [OPTIONS] -- COMMAND
+    > remote-command [OPTIONS] --scirpt SCRIPT
+
+    Options:
+    -C, --concurrency         concurrency, default 5
+    -h, --host                remote hosts
+        --sudo_password       sudo password
+        --ask_sudo_password   ask sudo password first with prompt
+    -s, --script              execute script instead of specifying commands
+        --help                show this help
+
+    Examples:
+    > remote-command -h exammple.com -- perl -e 'print "hello"'
+    > remote-command -h exampale.com,example.jp --ask_sudo_password \
+        -- 'sudo mkdir -m 0755 /opt/perl && sudo chown app:users /opt/perl'
+    > remote-command -h example.com --sudo_password hogehoge --script local-script.pl
+
+=head1 INSTALL
+
+    > cpanm git://github.com/shoichikaji/remote-command.git
+
+=head1 DESCRIPTION
+
+remote-command is a simple launcher of remote command. The features are:
+
+=over 4
+
+=item * execute remote command in parallel
+
+=item * remember sudo password first, and never ask again
+
+=item * you may specify a script file in local machine
+
+=item * append hostname to each command output lines
+
+=item * report success/fail summary
+
+=back
+
+=head1 LICENSE
+
+Copyright (C) Shoichi Kaji.
+
+This library is free software; you can redistribute it and/or modify it under the same terms as Perl itself.
+
+=head1 AUTHOR
+
+Shoichi Kaji E<lt>skaji@cpan.orgE<gt>
+
+=cut
+
+GetOptions
+    "C|concurrency=i"   => \(my $concurrency = 5),
+    "h|host=s"          => \(my $host_arg),
+    "help"              => sub { pod2usage(0) },
+    "sudo_password=s"   => \(my $sudo_password),
+    "ask_sudo_password" => \(my $ask_sudo_password),
+    "user=s"            => \(my $user = $ENV{USER}),
+    "s|script=s"        => \(my $script),
+or pod2usage(1);
+
+$host_arg or do { warn "--host option is required\n"; pod2usage(1) };
+my @command = @ARGV;
+if (!@command && !$script) {
+    warn "COMMAND or --script option is required\n";
+    pod2usage(1);
+}
+if ($script && !-r $script) {
+    die "Cannot read '$script'\n";
+}
+
+if ($ask_sudo_password) {
+    my $return = hide_prompt($SUDO_PROMPT);
+    unless ($return) { die };
+    $sudo_password = $return;
+}
+
+my $pm = Parallel::ForkManager->new($concurrency);
+my %exit;
+$pm->run_on_finish(sub {
+    my ($pid, $exit, $host, $signal) = @_;
+    $exit{$host} = { exit => $exit, signal => $signal };
+});
+setsid;
+local $SIG{INT} = sub {
+    local $SIG{INT} = "IGNORE";
+    kill INT => -$$;
+};
+
+my @host = split /[,\s]/, $host_arg;
+
+for my $host (@host) {
+    if ( (grep {$exit{$_}{exit} || $exit{$_}{signal}} sort keys %exit) > 2) {
+        warn "More than 2 hosts failed, thus stop executing.\n";
+        last; # XXX
+    }
+    $pm->start($host) and next;
+    $SIG{INT} = "DEFAULT";
+    my $exit = eval { do_ssh($host,
+        sudo_password => $sudo_password,
+        script    => $script,
+        command   => \@command,
+    ) };
+    if (my $e = $@) {
+        chomp $e;
+        warn "$e\n";
+        $exit = 255;
+    }
+    $pm->finish($exit);
+}
+
+while (keys %{$pm->{processes}}) {
+    $pm->wait_all_children;
+}
+
+my @success = grep { $exit{$_}{exit} == 0 && !$exit{$_}{signal} } sort keys %exit;
+my @fail    = grep { $exit{$_}{exit} != 0 || $exit{$_}{signal}  } sort keys %exit;
+print "\e[32mSUCESS\e[m $_\n" for @success;
+print "\e[31mFAIL\e[m $_\n" for @fail;
+exit( @fail ? 1 : 0 );
+
+
+sub command {
+    my @cmd = @_;
+    my @prefix = ("env", "SUDO_PROMPT=$SUDO_PROMPT");
+    if (@cmd == 1 && $cmd[0] =~ /\s/) {
+        (@prefix, "bash", "-c", $cmd[0]);
+    } else {
+        (@prefix, @cmd);
+    }
+}
+sub do_ssh {
+    my $host = shift;
+    my %option = @_;
+    my $sudo_password = $option{sudo_password};
+    my @command = @{ $option{command} };
+    my $script  = $option{script};
+
+    my $ssh = Net::OpenSSH->new($host);
+    if ($ssh->error) {
+        die $ssh->error, "\n";
+    }
+    my $do_clean = sub {};
+    if ($script) {
+        my $name = sprintf "/tmp/%s.%d.%d.%d", basename($0), time, $$, rand(1000);
+        $ssh->scp_put( $script, $name ) or die $ssh->error;
+        $do_clean = sub { $ssh->system("rm", "-f", $name) };
+        $ssh->system("chmod", "744", $name) or do { $do_clean->(); die $ssh->error };
+        @command = ($name);
+    }
+    my ($pty, $pid) = $ssh->open2pty( command(@command) )
+        or do { $do_clean->(); die $ssh->error, "\n" };
+    binmode $pty;
+    $pty->set_raw;
+    $pty->autoflush(1);
+
+    my $poll = IO::Poll->new;
+    $poll->mask($pty => POLLOUT | POLLIN);
+
+    my $error = "";
+    my $need_password = 0;
+    my $keep = "";
+    while (1) {
+        my $num = $poll->poll;
+        my $event = $poll->events($pty);
+        if ($event & POLLIN) {
+            my $len = sysread $pty, my $buffer, CHUNK_SIZE;
+            if ($len == 0) {
+                print "[$host] $keep\n" if $keep;
+                last;
+            }
+
+            my @split = split /\r?\n/, $buffer;
+
+            if (@split > 1) {
+                print "[$host] $keep$split[0]\n";
+                print "[$host] $_\n" for @split[1 .. ($#split -1)];
+                $keep = $split[-1];
+            } elsif (@split == 1) {
+                $keep .= $split[0];
+            } else {
+                # only LF achive here
+            }
+
+            if ($keep =~ /\Q$SUDO_PROMPT\E$/) {
+                $need_password = 1;
+                print "[$host] $keep";
+                $keep = "";
+            } elsif ($buffer =~ /\n$/) {
+                print "[$host] $keep\n";
+                $keep = "";
+            }
+
+            if (length $keep > CHUNK_SIZE) {
+                print "[$host] $keep\n";
+                $keep = "";
+            }
+        }
+        if ($event & POLLOUT) {
+            if ($need_password) {
+                unless ($sudo_password) {
+                    $error = "have to provide sudo passowrd first";
+                    last;
+                }
+                syswrite $pty, "$sudo_password\n";
+                print "\n";
+                $need_password = 0;
+            } else {
+                # TODO
+            }
+        }
+    }
+    close $pty or die "close pty: $!\n";
+    waitpid $pid, 0;
+    my $exit = $?;
+    $do_clean->();
+    if ($error) {
+        die "$error\n";
+    } else {
+        return $exit >> 8;
+    }
+}
+sub hide_prompt {
+    my $message = shift;
+    local $SIG{INT} = sub {
+        system "stty", "echo";
+        print "\n";
+        die "catch SIGINT, die\n";
+    };
+    local $| = 1;
+    system "stty", "-echo";
+    print $message;
+    chomp( my $str = <STDIN> );
+    print "\n";
+    system "stty", "echo";
+    return $str;
+}
+
