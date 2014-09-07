@@ -22,13 +22,13 @@ remote-command - simple launcher of remote command
 =head1 SYNOPSIS
 
     > remote-command [OPTIONS] -- COMMAND
-    > remote-command [OPTIONS] --scirpt SCRIPT
+    > remote-command [OPTIONS] --script SCRIPT
 
     Options:
     -C, --concurrency         concurrency, default 5
     -h, --host                remote hosts
         --sudo_password       sudo password
-        --ask_sudo_password   ask sudo password first with prompt
+    -A, --ask_sudo_password   ask sudo password first with prompt
     -s, --script              execute script instead of specifying commands
         --help                show this help
 
@@ -73,13 +73,13 @@ Shoichi Kaji E<lt>skaji@cpan.orgE<gt>
 =cut
 
 GetOptions
-    "C|concurrency=i"   => \(my $concurrency = 5),
-    "h|host=s"          => \(my $host_arg),
-    "help"              => sub { pod2usage(0) },
-    "sudo_password=s"   => \(my $sudo_password),
-    "ask_sudo_password" => \(my $ask_sudo_password),
-    "user=s"            => \(my $user = $ENV{USER}),
-    "s|script=s"        => \(my $script),
+    "C|concurrency=i"     => \(my $concurrency = 5),
+    "h|host=s"            => \(my $host_arg),
+    "help"                => sub { pod2usage(0) },
+    "sudo_password=s"     => \(my $sudo_password),
+    "A|ask_sudo_password" => \(my $ask_sudo_password),
+    "user=s"              => \(my $user = $ENV{USER}),
+    "s|script=s"          => \(my $script),
 or pod2usage(1);
 
 $host_arg or do { warn "--host option is required\n"; pod2usage(1) };
@@ -171,7 +171,7 @@ sub do_ssh {
         $ssh->system("chmod", "744", $name) or do { $do_clean->(); die $ssh->error };
         @command = ($name);
     }
-    my ($pty, $pid) = $ssh->open2pty( command(@command) )
+    my ($pty, $err, $pid) = $ssh->open3pty( command(@command) )
         or do { $do_clean->(); die $ssh->error, "\n" };
     binmode $pty;
     $pty->set_raw;
@@ -179,12 +179,27 @@ sub do_ssh {
 
     my $poll = IO::Poll->new;
     $poll->mask($pty => POLLOUT | POLLIN);
+    $poll->mask($err => POLLIN);
 
     my $error = "";
     my $need_password = 0;
     my $keep = "";
     while (1) {
         my $num = $poll->poll;
+        last if $num <= 0;
+
+        if ($poll->events($err)) {
+            my $len = sysread $err, my $buffer, CHUNK_SIZE;
+            if ($len == 0) {
+                $poll->remove($err);
+                close $err;
+                undef $err;
+            } else {
+                my @split = split /\r?\n/, $buffer;
+                print STDERR "[$host] $_\n" for @split;
+            }
+        }
+
         my $event = $poll->events($pty);
         if ($event & POLLIN) {
             my $len = sysread $pty, my $buffer, CHUNK_SIZE;
@@ -225,8 +240,13 @@ sub do_ssh {
                     $error = "have to provide sudo passowrd first";
                     last;
                 }
+                my $sigpipe = 0;
+                local $SIG{PIPE} = sub { $sigpipe++ };
                 syswrite $pty, "$sudo_password\n";
-                print "\n";
+                if ($sigpipe) {
+                    warn "---> sigpipe";
+                }
+                # print "\n";
                 $need_password = 0;
             } else {
                 # TODO
@@ -234,6 +254,7 @@ sub do_ssh {
         }
     }
     close $pty or die "close pty: $!\n";
+    close $err if $err;
     waitpid $pid, 0;
     my $exit = $?;
     $do_clean->();
